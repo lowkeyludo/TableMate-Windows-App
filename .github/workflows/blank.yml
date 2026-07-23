@@ -25,8 +25,20 @@ jobs:
 
           if ((Test-Path "$sourceDir\part-001.b64") -and (Test-Path "$sourceDir\part-002.b64")) {
             Write-Host "Found base64 source chunks. Rebuilding ZIP..."
-            $b64 = (Get-Content "$sourceDir\part-001.b64" -Raw) + (Get-Content "$sourceDir\part-002.b64" -Raw)
+
+            $parts = Get-ChildItem -Path $sourceDir -Filter "part-*.b64" | Sort-Object Name
+            Write-Host "Chunk count: $($parts.Count)"
+
+            $b64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ""
+            $b64 = $b64 -replace '[^A-Za-z0-9+/=]', ''
+            Write-Host "Clean base64 length: $($b64.Length)"
+
+            while (($b64.Length % 4) -ne 0) {
+              $b64 += "="
+            }
+
             [IO.File]::WriteAllBytes($zipPath, [Convert]::FromBase64String($b64))
+            Write-Host "ZIP rebuilt at: $zipPath"
 
             New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
             Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
