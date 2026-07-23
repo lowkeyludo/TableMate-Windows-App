@@ -23,40 +23,97 @@ jobs:
           $zipPath = "$env:GITHUB_WORKSPACE\tablemate-source.zip"
           $extractDir = "$env:GITHUB_WORKSPACE\tablemate-extracted"
 
+          function Clean-B64([string]$text) {
+            $clean = $text -replace '[^A-Za-z0-9+/=]', ''
+            return $clean
+          }
+
+          function Pad-B64([string]$text) {
+            while (($text.Length % 4) -ne 0) { $text += "=" }
+            return $text
+          }
+
+          function Test-Zip([string]$path) {
+            try {
+              if (-not (Test-Path $path)) { return $false }
+              if ((Get-Item $path).Length -lt 100) { return $false }
+              $testDir = "$env:GITHUB_WORKSPACE\zip-test"
+              if (Test-Path $testDir) { Remove-Item $testDir -Recurse -Force }
+              New-Item -ItemType Directory -Force -Path $testDir | Out-Null
+              Expand-Archive -Path $path -DestinationPath $testDir -Force
+              return $true
+            }
+            catch {
+              Write-Host "ZIP test failed: $($_.Exception.Message)"
+              return $false
+            }
+          }
+
           if (Test-Path $sourceDir) {
             $parts = Get-ChildItem -Path $sourceDir -Filter "part-*.b64" | Sort-Object Name
-          }
-          else {
+          } else {
             $parts = @()
           }
 
           if ($parts.Count -gt 0) {
-            Write-Host "Found $($parts.Count) base64 source chunk(s). Rebuilding ZIP by decoding each chunk separately..."
+            Write-Host "Found $($parts.Count) source chunk(s)."
 
-            if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-            $stream = [System.IO.File]::Open($zipPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
+            $rebuilt = $false
 
+            # Method 1: chunks are pieces of one base64 string
             try {
-              foreach ($part in $parts) {
-                Write-Host "Decoding $($part.Name)..."
-                $b64 = Get-Content $part.FullName -Raw
-                $b64 = $b64 -replace '[^A-Za-z0-9+/=]', ''
+              Write-Host "Trying rebuild method 1: joined base64 string..."
+              $joined = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ""
+              $joined = Clean-B64 $joined
 
-                while (($b64.Length % 4) -ne 0) {
-                  $b64 += "="
-                }
+              # remove padding that appears before the final end, then pad once at the end
+              $joinedNoPad = $joined -replace '=', ''
+              $joinedNoPad = Pad-B64 $joinedNoPad
 
-                $bytes = [Convert]::FromBase64String($b64)
-                $stream.Write($bytes, 0, $bytes.Length)
+              [IO.File]::WriteAllBytes($zipPath, [Convert]::FromBase64String($joinedNoPad))
+
+              if (Test-Zip $zipPath) {
+                Write-Host "Method 1 worked."
+                $rebuilt = $true
               }
             }
-            finally {
-              $stream.Close()
+            catch {
+              Write-Host "Method 1 failed: $($_.Exception.Message)"
             }
 
-            Write-Host "ZIP rebuilt at: $zipPath"
-            Get-Item $zipPath | Select-Object FullName, Length
+            # Method 2: each part is its own base64-encoded byte block
+            if (-not $rebuilt) {
+              try {
+                Write-Host "Trying rebuild method 2: decode each chunk and append bytes..."
+                if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 
+                foreach ($part in $parts) {
+                  Write-Host "Decoding $($part.Name)..."
+                  $txt = Get-Content $part.FullName -Raw
+                  $txt = Clean-B64 $txt
+                  $txt = Pad-B64 $txt
+                  $bytes = [Convert]::FromBase64String($txt)
+                  [IO.File]::Open($zipPath, [IO.FileMode]::Append).Close()
+                  $stream = [IO.File]::Open($zipPath, [IO.FileMode]::Append)
+                  $stream.Write($bytes, 0, $bytes.Length)
+                  $stream.Close()
+                }
+
+                if (Test-Zip $zipPath) {
+                  Write-Host "Method 2 worked."
+                  $rebuilt = $true
+                }
+              }
+              catch {
+                Write-Host "Method 2 failed: $($_.Exception.Message)"
+              }
+            }
+
+            if (-not $rebuilt) {
+              throw "Could not rebuild a valid ZIP from source/part-*.b64. The source chunk files are damaged or incomplete."
+            }
+
+            if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
             New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
             Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
 
@@ -84,7 +141,7 @@ jobs:
               Select-Object -First 1
 
             if (-not $package) {
-              throw "No package.json found. Upload the full TableMate repo contents or keep source/part-*.b64."
+              throw "No package.json found. Upload the full TableMate repo contents or source chunks."
             }
 
             $appDir = Split-Path $package.FullName -Parent
