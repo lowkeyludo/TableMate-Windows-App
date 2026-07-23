@@ -14,45 +14,59 @@ jobs:
       - name: Check out project
         uses: actions/checkout@v4
 
+      - name: Rebuild TableMate repo from source chunks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $sourceDir = "$env:GITHUB_WORKSPACE\source"
+          $zipPath = "$env:GITHUB_WORKSPACE\tablemate-source.zip"
+          $extractDir = "$env:GITHUB_WORKSPACE\tablemate-extracted"
+
+          if ((Test-Path "$sourceDir\part-001.b64") -and (Test-Path "$sourceDir\part-002.b64")) {
+            Write-Host "Found base64 source chunks. Rebuilding ZIP..."
+            $b64 = (Get-Content "$sourceDir\part-001.b64" -Raw) + (Get-Content "$sourceDir\part-002.b64" -Raw)
+            [IO.File]::WriteAllBytes($zipPath, [Convert]::FromBase64String($b64))
+
+            New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+            Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+            $package = Get-ChildItem -Path $extractDir -Filter package.json -Recurse |
+              Where-Object { $_.FullName -notmatch "\\node_modules\\" } |
+              Sort-Object FullName |
+              Select-Object -First 1
+
+            if (-not $package) {
+              throw "No package.json found after extracting the TableMate source ZIP."
+            }
+
+            $appDir = Split-Path $package.FullName -Parent
+            echo "APP_DIR=$appDir" >> $env:GITHUB_ENV
+            Write-Host "Using extracted app folder: $appDir"
+          }
+          elseif (Test-Path "$env:GITHUB_WORKSPACE\package.json") {
+            echo "APP_DIR=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
+            Write-Host "Using root app folder."
+          }
+          else {
+            $package = Get-ChildItem -Path "$env:GITHUB_WORKSPACE" -Filter package.json -Recurse |
+              Where-Object { $_.FullName -notmatch "\\node_modules\\" } |
+              Sort-Object FullName |
+              Select-Object -First 1
+
+            if (-not $package) {
+              throw "No package.json found. Upload the full TableMate repo contents or keep source/part-001.b64 and source/part-002.b64."
+            }
+
+            $appDir = Split-Path $package.FullName -Parent
+            echo "APP_DIR=$appDir" >> $env:GITHUB_ENV
+            Write-Host "Using discovered app folder: $appDir"
+          }
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-
-      - name: Find TableMate app folder
-        shell: pwsh
-        run: |
-          $rootPackage = "$env:GITHUB_WORKSPACE\package.json"
-          $namedPackage = "$env:GITHUB_WORKSPACE\TableMate_Windows_App_v90_Backup_Button_Fixed_Repo\package.json"
-
-          if (Test-Path $rootPackage) {
-            $appDir = "$env:GITHUB_WORKSPACE"
-          }
-          elseif (Test-Path $namedPackage) {
-            $appDir = "$env:GITHUB_WORKSPACE\TableMate_Windows_App_v90_Backup_Button_Fixed_Repo"
-          }
-          else {
-            $packages = Get-ChildItem -Path "$env:GITHUB_WORKSPACE" -Filter package.json -Recurse |
-              Where-Object { $_.FullName -notmatch "\\node_modules\\" } |
-              Sort-Object FullName
-
-            $preferred = $packages |
-              Where-Object { $_.FullName -match "v90|Backup|Fixed|TableMate" } |
-              Select-Object -First 1
-
-            if ($preferred) {
-              $appDir = Split-Path $preferred.FullName -Parent
-            }
-            elseif ($packages.Count -gt 0) {
-              $appDir = Split-Path $packages[0].FullName -Parent
-            }
-            else {
-              throw "No package.json found. Upload the CONTENTS of the TableMate repo folder, or upload the folder named TableMate_Windows_App_v90_Backup_Button_Fixed_Repo."
-            }
-          }
-
-          echo "APP_DIR=$appDir" >> $env:GITHUB_ENV
-          Write-Host "Using app folder: $appDir"
 
       - name: Install dependencies
         shell: pwsh
