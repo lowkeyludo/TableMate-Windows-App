@@ -14,145 +14,115 @@ jobs:
       - name: Check out project
         uses: actions/checkout@v4
 
-      - name: Rebuild TableMate repo from source chunks
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $sourceDir = "$env:GITHUB_WORKSPACE\source"
-          $zipPath = "$env:GITHUB_WORKSPACE\tablemate-source.zip"
-          $extractDir = "$env:GITHUB_WORKSPACE\tablemate-extracted"
-
-          function Clean-B64([string]$text) {
-            $clean = $text -replace '[^A-Za-z0-9+/=]', ''
-            return $clean
-          }
-
-          function Pad-B64([string]$text) {
-            while (($text.Length % 4) -ne 0) { $text += "=" }
-            return $text
-          }
-
-          function Test-Zip([string]$path) {
-            try {
-              if (-not (Test-Path $path)) { return $false }
-              if ((Get-Item $path).Length -lt 100) { return $false }
-              $testDir = "$env:GITHUB_WORKSPACE\zip-test"
-              if (Test-Path $testDir) { Remove-Item $testDir -Recurse -Force }
-              New-Item -ItemType Directory -Force -Path $testDir | Out-Null
-              Expand-Archive -Path $path -DestinationPath $testDir -Force
-              return $true
-            }
-            catch {
-              Write-Host "ZIP test failed: $($_.Exception.Message)"
-              return $false
-            }
-          }
-
-          if (Test-Path $sourceDir) {
-            $parts = Get-ChildItem -Path $sourceDir -Filter "part-*.b64" | Sort-Object Name
-          } else {
-            $parts = @()
-          }
-
-          if ($parts.Count -gt 0) {
-            Write-Host "Found $($parts.Count) source chunk(s)."
-
-            $rebuilt = $false
-
-            # Method 1: chunks are pieces of one base64 string
-            try {
-              Write-Host "Trying rebuild method 1: joined base64 string..."
-              $joined = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ""
-              $joined = Clean-B64 $joined
-
-              # remove padding that appears before the final end, then pad once at the end
-              $joinedNoPad = $joined -replace '=', ''
-              $joinedNoPad = Pad-B64 $joinedNoPad
-
-              [IO.File]::WriteAllBytes($zipPath, [Convert]::FromBase64String($joinedNoPad))
-
-              if (Test-Zip $zipPath) {
-                Write-Host "Method 1 worked."
-                $rebuilt = $true
-              }
-            }
-            catch {
-              Write-Host "Method 1 failed: $($_.Exception.Message)"
-            }
-
-            # Method 2: each part is its own base64-encoded byte block
-            if (-not $rebuilt) {
-              try {
-                Write-Host "Trying rebuild method 2: decode each chunk and append bytes..."
-                if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-
-                foreach ($part in $parts) {
-                  Write-Host "Decoding $($part.Name)..."
-                  $txt = Get-Content $part.FullName -Raw
-                  $txt = Clean-B64 $txt
-                  $txt = Pad-B64 $txt
-                  $bytes = [Convert]::FromBase64String($txt)
-                  [IO.File]::Open($zipPath, [IO.FileMode]::Append).Close()
-                  $stream = [IO.File]::Open($zipPath, [IO.FileMode]::Append)
-                  $stream.Write($bytes, 0, $bytes.Length)
-                  $stream.Close()
-                }
-
-                if (Test-Zip $zipPath) {
-                  Write-Host "Method 2 worked."
-                  $rebuilt = $true
-                }
-              }
-              catch {
-                Write-Host "Method 2 failed: $($_.Exception.Message)"
-              }
-            }
-
-            if (-not $rebuilt) {
-              throw "Could not rebuild a valid ZIP from source/part-*.b64. The source chunk files are damaged or incomplete."
-            }
-
-            if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
-            New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
-            Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-
-            $package = Get-ChildItem -Path $extractDir -Filter package.json -Recurse |
-              Where-Object { $_.FullName -notmatch "\\node_modules\\" } |
-              Sort-Object FullName |
-              Select-Object -First 1
-
-            if (-not $package) {
-              throw "No package.json found after extracting the TableMate source ZIP."
-            }
-
-            $appDir = Split-Path $package.FullName -Parent
-            echo "APP_DIR=$appDir" >> $env:GITHUB_ENV
-            Write-Host "Using extracted app folder: $appDir"
-          }
-          elseif (Test-Path "$env:GITHUB_WORKSPACE\package.json") {
-            echo "APP_DIR=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
-            Write-Host "Using root app folder."
-          }
-          else {
-            $package = Get-ChildItem -Path "$env:GITHUB_WORKSPACE" -Filter package.json -Recurse |
-              Where-Object { $_.FullName -notmatch "\\node_modules\\" } |
-              Sort-Object FullName |
-              Select-Object -First 1
-
-            if (-not $package) {
-              throw "No package.json found. Upload the full TableMate repo contents or source chunks."
-            }
-
-            $appDir = Split-Path $package.FullName -Parent
-            echo "APP_DIR=$appDir" >> $env:GITHUB_ENV
-            Write-Host "Using discovered app folder: $appDir"
-          }
-
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
+
+      - name: Prepare TableMate app folder
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $rootPackage = "$env:GITHUB_WORKSPACE\package.json"
+          $rootIndex = "$env:GITHUB_WORKSPACE\app\index.html"
+          $sourceDir = "$env:GITHUB_WORKSPACE\source"
+          $zipPath = "$env:GITHUB_WORKSPACE\tablemate-source.zip"
+          $extractDir = "$env:GITHUB_WORKSPACE\tablemate-extracted"
+
+          if ((Test-Path $rootPackage) -and (Test-Path $rootIndex)) {
+            echo "APP_DIR=$env:GITHUB_WORKSPACE" >> $env:GITHUB_ENV
+            Write-Host "Using root app folder."
+            exit 0
+          }
+
+          if (-not (Test-Path $sourceDir)) {
+            throw "No app/index.html found and no source folder found. Upload the full repo contents or keep source/part-*.b64."
+          }
+
+          Write-Host "Root app is incomplete. Rebuilding from source/part-*.b64..."
+
+          $rebuildScript = @'
+          const fs = require("fs");
+          const path = require("path");
+          const zlib = require("zlib");
+
+          const workspace = process.env.GITHUB_WORKSPACE;
+          const sourceDir = path.join(workspace, "source");
+          const zipPath = path.join(workspace, "tablemate-source.zip");
+          const parts = fs.readdirSync(sourceDir)
+            .filter(name => /^part-.*\.b64$/i.test(name))
+            .sort();
+
+          if (!parts.length) throw new Error("No source/part-*.b64 files found.");
+          console.log("Chunk count:", parts.length);
+
+          function clean(txt) {
+            return String(txt || "").replace(/[^A-Za-z0-9+/=]/g, "");
+          }
+          function pad(txt) {
+            while (txt.length % 4 !== 0) txt += "=";
+            return txt;
+          }
+          function looksLikeZip(buf) {
+            return buf && buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b;
+          }
+
+          let zip = null;
+
+          // Method 1: all files are pieces of one base64 string.
+          try {
+            let joined = parts.map(name => fs.readFileSync(path.join(sourceDir, name), "utf8")).join("");
+            joined = clean(joined).replace(/=/g, "");
+            const buf = Buffer.from(pad(joined), "base64");
+            console.log("Method 1 byte length:", buf.length);
+            if (looksLikeZip(buf)) zip = buf;
+          } catch (err) {
+            console.log("Method 1 failed:", err.message);
+          }
+
+          // Method 2: each file is a separately encoded byte chunk.
+          if (!zip) {
+            try {
+              const buffers = [];
+              for (const name of parts) {
+                let txt = clean(fs.readFileSync(path.join(sourceDir, name), "utf8"));
+                const buf = Buffer.from(pad(txt), "base64");
+                console.log(name, "decoded bytes:", buf.length);
+                buffers.push(buf);
+              }
+              const joined = Buffer.concat(buffers);
+              console.log("Method 2 byte length:", joined.length);
+              if (looksLikeZip(joined)) zip = joined;
+            } catch (err) {
+              console.log("Method 2 failed:", err.message);
+            }
+          }
+
+          if (!zip) throw new Error("Could not rebuild a valid ZIP. The source chunks are damaged or were uploaded incorrectly.");
+          fs.writeFileSync(zipPath, zip);
+          console.log("ZIP rebuilt:", zipPath, "bytes:", zip.length);
+          '@
+
+          Set-Content -Path "$env:GITHUB_WORKSPACE\rebuild-source.js" -Value $rebuildScript -Encoding UTF8
+          node "$env:GITHUB_WORKSPACE\rebuild-source.js"
+
+          if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $extractDir | Out-Null
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+          $package = Get-ChildItem -Path $extractDir -Filter package.json -Recurse |
+            Where-Object { $_.FullName -notmatch "\\node_modules\\" } |
+            Sort-Object FullName |
+            Select-Object -First 1
+
+          if (-not $package) {
+            throw "No package.json found after extracting TableMate source ZIP."
+          }
+
+          $appDir = Split-Path $package.FullName -Parent
+          echo "APP_DIR=$appDir" >> $env:GITHUB_ENV
+          Write-Host "Using extracted app folder: $appDir"
 
       - name: Install dependencies
         shell: pwsh
